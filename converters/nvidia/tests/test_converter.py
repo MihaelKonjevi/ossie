@@ -954,6 +954,152 @@ def test_relationships_emit_join_physical_fk_and_semantic_fk() -> None:
     assert restored["relationships"][0]["to"] == "customers"
 
 
+def _sample_uniqueness(
+    native: dict[str, Any], table_name: str, **is_unique: bool
+) -> dict[str, Any]:
+    table = next(
+        table
+        for table in native["data_layer"]["databases"][0]["schemas"][0]["tables"]
+        if table["name"] == table_name
+    )
+    for column in table["columns"]:
+        if column["name"] in is_unique:
+            column["is_unique"] = is_unique[column["name"]]
+    return table
+
+
+def _datasets(native: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    ossie = yaml.safe_load(convert_auto_ontology_to_ossie(yaml.safe_dump(native)))
+    return {dataset["name"]: dataset for dataset in ossie["datasets"]}
+
+
+def test_sampled_uniqueness_is_a_key_only_where_a_relationship_references_it() -> None:
+    native = yaml.safe_load(_auto_ontology_yaml())
+    _sample_uniqueness(native, "customers", customer_id=True, name=True)["pk"] = []
+    _sample_uniqueness(native, "orders", order_date=True, subtotal=True)
+
+    datasets = _datasets(native)
+
+    # orders.customer_id references customers.customer_id.
+    assert datasets["customers"]["unique_keys"] == [["customer_id"]]
+    # Distinct values in a sample do not make a date or an amount a key.
+    assert "unique_keys" not in datasets["orders"]
+
+
+def test_a_referenced_column_with_repeated_sample_values_is_not_a_key() -> None:
+    native = yaml.safe_load(_auto_ontology_yaml())
+    _sample_uniqueness(native, "customers", customer_id=False)["pk"] = []
+
+    assert "unique_keys" not in _datasets(native)["customers"]
+
+
+def test_a_unique_key_the_primary_key_states_is_not_repeated() -> None:
+    datasets = _datasets(yaml.safe_load(_auto_ontology_yaml()))
+
+    assert datasets["customers"]["primary_key"] == ["customer_id"]
+    assert "unique_keys" not in datasets["customers"]
+
+
+def _orders_sql_attribute(sql: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Convert the fixture with *sql* as an orders SQL attribute.
+
+    Returns the Ossie field it becomes and the whole Ossie document.
+    """
+    native = yaml.safe_load(_auto_ontology_yaml())
+    orders = next(
+        term for term in native["semantic_layer"]["terms"] if term["name"] == "orders"
+    )
+    native["semantic_layer"]["sql_attributes"]["sql"].append(
+        {
+            "id": "discounted-orders",
+            "name": "discounted",
+            "description": "Orders that received a discount",
+            "sql": sql,
+            "sql_column_is": [],
+            "term_id": orders["id"],
+        }
+    )
+    ossie = yaml.safe_load(convert_auto_ontology_to_ossie(yaml.safe_dump(native)))
+    field = next(
+        field
+        for dataset in ossie["datasets"]
+        if dataset["name"] == "orders"
+        for field in dataset["fields"]
+        if field["name"] == "discounted"
+    )
+    return field, ossie
+
+
+def _restored_sql_attribute(ossie: dict[str, Any]) -> dict[str, Any]:
+    restored = yaml.safe_load(convert_ossie_to_auto_ontology(yaml.safe_dump(ossie)))
+    [restored_attribute] = restored["semantic_layer"]["sql_attributes"]["sql"]
+    assert restored_attribute["id"] == "discounted-orders"
+    return restored_attribute
+
+
+def test_a_filter_becomes_a_boolean_field_holding_its_condition() -> None:
+    sql = 'SELECT * FROM "analytics"."public"."orders" WHERE "discount" > 0'
+    field, ossie = _orders_sql_attribute(sql)
+
+    assert field["expression"]["dialects"][0]["expression"] == '"discount" > 0'
+    assert field["datatype"] == "Boolean"
+    assert _restored_sql_attribute(ossie)["sql"] == sql
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            'SELECT * FROM "analytics"."public"."orders" AS "o" '
+            'JOIN "analytics"."public"."customers" AS "c" '
+            'ON "o"."customer_id" = "c"."customer_id" WHERE "c"."vip"',
+            id="join",
+        ),
+        pytest.param(
+            'SELECT * FROM "analytics"."public"."orders" AS "o", '
+            '"analytics"."public"."customers" AS "c" WHERE "c"."vip"',
+            id="comma-join",
+        ),
+        pytest.param(
+            'SELECT * FROM "analytics"."public"."orders" WHERE "discount" > 0 LIMIT 10',
+            id="limit",
+        ),
+        pytest.param(
+            'SELECT * FROM "analytics"."public"."orders" WHERE "discount" > 0 '
+            'GROUP BY "customer_id" HAVING COUNT(*) > 1',
+            id="group-by",
+        ),
+        pytest.param(
+            'SELECT DISTINCT * FROM "analytics"."public"."orders" WHERE "discount" > 0',
+            id="distinct",
+        ),
+        pytest.param(
+            'SELECT * FROM "analytics"."public"."orders" WHERE "discount" > 0 '
+            'ORDER BY "subtotal"',
+            id="order-by",
+        ),
+        pytest.param(
+            'SELECT * FROM "analytics"."public"."orders" WHERE "discount" > 0 '
+            'UNION SELECT * FROM "analytics"."public"."orders" WHERE "subtotal" > 0',
+            id="union",
+        ),
+        pytest.param(
+            'SELECT * FROM (SELECT * FROM "analytics"."public"."orders") AS "o" '
+            'WHERE "discount" > 0',
+            id="subquery",
+        ),
+    ],
+)
+def test_a_query_that_does_more_than_filter_one_table_is_no_boolean_field(
+    sql: str,
+) -> None:
+    field, ossie = _orders_sql_attribute(sql)
+
+    assert "datatype" not in field
+    assert field["expression"]["dialects"][0]["expression"] == "*"
+    assert _restored_sql_attribute(ossie)["sql"] == sql
+
+
 def test_auto_ontology_requires_one_represented_table_per_term() -> None:
     native = yaml.safe_load(_auto_ontology_yaml())
     term = native["semantic_layer"]["terms"][0]
